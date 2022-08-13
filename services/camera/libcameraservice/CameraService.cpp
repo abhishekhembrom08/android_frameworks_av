@@ -34,6 +34,7 @@
 
 #include <android-base/macros.h>
 #include <android-base/parseint.h>
+#include <android-base/properties.h>
 #include <android-base/stringprintf.h>
 #include <binder/ActivityManager.h>
 #include <binder/AppOpsManager.h>
@@ -84,6 +85,7 @@ namespace {
 namespace android {
 
 using base::StringPrintf;
+using base::SetProperty;
 using binder::Status;
 using camera3::SessionConfigurationUtils;
 using frameworks::cameraservice::service::V2_0::implementation::HidlCameraService;
@@ -1834,11 +1836,9 @@ Status CameraService::connectHelper(const sp<CALLBACK>& cameraCb, const String8&
         // Set rotate-and-crop override behavior
         if (mOverrideRotateAndCropMode != ANDROID_SCALER_ROTATE_AND_CROP_AUTO) {
             client->setRotateAndCropOverride(mOverrideRotateAndCropMode);
-        } else if (effectiveApiLevel == API_2) {
-
-          client->setRotateAndCropOverride(
-              CameraServiceProxyWrapper::getRotateAndCropOverride(
-                  clientPackageName, facing, multiuser_get_user_id(clientUid)));
+        } else if (CameraServiceProxyWrapper::isRotateAndCropOverrideNeeded(clientPackageName,
+                    orientation, facing)) {
+            client->setRotateAndCropOverride(ANDROID_SCALER_ROTATE_AND_CROP_90);
         }
 
         // Set camera muting behavior
@@ -2185,6 +2185,7 @@ Status CameraService::notifyDeviceStateChange(int64_t newState) {
     newDeviceState |= vendorBits;
 
     ALOGV("%s: New device state 0x%" PRIx64, __FUNCTION__, newDeviceState);
+    Mutex::Autolock l(mServiceLock);
     mCameraProviderManager->notifyDeviceStateChange(newDeviceState);
 
     return Status::ok();
@@ -2218,12 +2219,14 @@ Status CameraService::notifyDisplayConfigurationChange() {
     for (auto& current : clients) {
         if (current != nullptr) {
             const auto basicClient = current->getValue();
-            if (basicClient.get() != nullptr && basicClient->canCastToApiClient(API_2)) {
-              basicClient->setRotateAndCropOverride(
-                  CameraServiceProxyWrapper::getRotateAndCropOverride(
-                      basicClient->getPackageName(),
-                      basicClient->getCameraFacing(),
-                      multiuser_get_user_id(basicClient->getClientUid())));
+            if (basicClient.get() != nullptr) {
+                if (CameraServiceProxyWrapper::isRotateAndCropOverrideNeeded(
+                            basicClient->getPackageName(), basicClient->getCameraOrientation(),
+                            basicClient->getCameraFacing())) {
+                    basicClient->setRotateAndCropOverride(ANDROID_SCALER_ROTATE_AND_CROP_90);
+                } else {
+                    basicClient->setRotateAndCropOverride(ANDROID_SCALER_ROTATE_AND_CROP_NONE);
+                }
             }
         }
     }
@@ -3184,6 +3187,15 @@ status_t CameraService::BasicClient::startCameraOps() {
     }
 
     mOpsActive = true;
+
+    // Configure miui camera mode
+    if (strcmp(String8(mClientPackageName).string(), "com.android.camera") == 0) {
+        SetProperty("sys.camera.miui.apk", "1");
+        ALOGI("Enabling miui camera mode");
+    } else {
+        SetProperty("sys.camera.miui.apk", "0");
+        ALOGI("Disabling miui camera mode");
+    }
 
     // Transition device availability listeners from PRESENT -> NOT_AVAILABLE
     sCameraService->updateStatus(StatusInternal::NOT_AVAILABLE, mCameraIdStr);
